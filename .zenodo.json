@@ -1,0 +1,24 @@
+{
+  "title": "lac-tele-peat-loss-workflow",
+  "description": "Reproducible R Markdown workflow used to generate geospatial raster/vector products, tabular summaries, and publication figures for a Nature Scientific Data Data Descriptor on peat swamp forest and forest-cover loss screening in the Lac Télé–Likouala-aux-Herbes landscape (Republic of the Congo), 2001–2024.",
+  "creators": [
+    {
+      "name": "Batchi-Bouyou, Armel Landry",
+      "affiliation": "Université Marien Ngouabi / Washington University in St. Louis",
+      "orcid": "0000-0000-0000-0000"
+    }
+  ],
+  "license": "MIT",
+  "upload_type": "software",
+  "access_right": "open",
+  "keywords": [
+    "Congo Basin",
+    "peatland",
+    "forest loss",
+    "remote sensing",
+    "geospatial workflow",
+    "Hansen Global Forest Change",
+    "Lac Télé"
+  ],
+  "version": "v1.0.0"
+}

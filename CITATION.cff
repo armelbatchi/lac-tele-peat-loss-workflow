@@ -5,7 +5,7 @@ type: software
 authors:
   - family-names: "Batchi-Bouyou"
     given-names: "Armel Landry"
-    orcid: "https://orcid.org/0000-0000-0000-0000" # replace if available
+    orcid: "https://orcid.org/0000-0002-7323-9894"
 identifiers:
   - type: url
     value: "https://github.com/armelbatchi/lac-tele-peat-loss-workflow"
@@ -13,7 +13,7 @@ repository-code: "https://github.com/armelbatchi/lac-tele-peat-loss-workflow"
 url: "https://github.com/armelbatchi/lac-tele-peat-loss-workflow"
 license: "MIT"
 version: "v1.0.0"
-date-released: 2026-02-25 # replace with actual GitHub release date
+date-released: 2026-02-25
 keywords:
   - Congo Basin
   - peatland

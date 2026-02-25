@@ -1,0 +1,21 @@
+# R
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+# R Markdown / Quarto intermediates
+*_cache/
+*_files/
+*.html
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Keep large data products out of this code repo
+outputs_all.zip
+*.tif
+*.gpkg
+*.geojson
+*.png

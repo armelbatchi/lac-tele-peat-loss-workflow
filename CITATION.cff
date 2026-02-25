@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the Zenodo-archived release and the associated Data Descriptor manuscript."
+title: "lac-tele-peat-loss-workflow"
+type: software
+authors:
+  - family-names: "Batchi-Bouyou"
+    given-names: "Armel Landry"
+    orcid: "https://orcid.org/0000-0000-0000-0000" # replace if available
+identifiers:
+  - type: url
+    value: "https://github.com/armelbatchi/lac-tele-peat-loss-workflow"
+repository-code: "https://github.com/armelbatchi/lac-tele-peat-loss-workflow"
+url: "https://github.com/armelbatchi/lac-tele-peat-loss-workflow"
+license: "MIT"
+version: "v1.0.0"
+date-released: 2026-02-25 # replace with actual GitHub release date
+keywords:
+  - Congo Basin
+  - peatland
+  - peat swamp forest
+  - forest loss
+  - remote sensing
+  - geospatial data
+  - Hansen Global Forest Change
+  - Lac Télé
+abstract: >
+  Reproducible R Markdown workflow for generating clipped geospatial rasters,
+  vector layers, tabular summaries, and validation-point outputs for peat swamp
+  forest and forest-cover loss screening in the Lac Télé–Likouala-aux-Herbes
+  landscape (Republic of the Congo), 2001–2024.

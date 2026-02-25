@@ -1,6 +1,6 @@
 # Lac Télé peat-swamp forest loss workflow (Republic of the Congo, 2001–2024)
 
-This repository contains the reproducible R Markdown workflow used to generate geospatial raster/vector products, tabular summaries, and publication figures for a **Nature Scientific Data** Data Descriptor on peat swamp forest and forest-cover loss screening in the Lac Télé–Likouala-aux-Herbes landscape (Republic of the Congo), 2001–2024.
+This repository contains the reproducible R Markdown workflow used to generate geospatial raster/vector products, tabular summaries, and publication figures on peat swamp forest and forest-cover loss screening in the Lac Télé–Likouala-aux-Herbes landscape (Republic of the Congo), 2001–2024.
 
 ## Repository contents
 
@@ -8,27 +8,31 @@ This repository contains the reproducible R Markdown workflow used to generate g
 - `CITATION.cff` — citation metadata for this code repository
 - `.zenodo.json` — Zenodo metadata for GitHub release archiving
 - `LICENSE` — MIT license (code)
-- *(optional)* additional helper scripts, documentation, and environment files
+- `README.md` — repository overview and persistent identifiers
+- `reproduce.md` — quick reproduction notes
+- `sessionInfo.txt` — R session/package versions used for this release
 
 ## Data availability (separate repository)
 
-The **dataset files** (including `outputs_all.zip`) are archived separately in a DOI-issuing repository (Zenodo) and are **not stored in this GitHub repository**.
+The **dataset files** (including `outputs_all.zip`) are archived separately in Zenodo and are **not stored in this GitHub repository**.
 
-- Dataset DOI (pre-reserved; version-specific, pending publication): `https://doi.org/10.5281/zenodo.18770921`
-- Dataset record (all versions / concept DOI): `TO BE ADDED AFTER ZENODO PUBLICATION`
-
-> Note: The DOI above is a Zenodo pre-reserved DOI for the dataset draft. After publication, Zenodo will activate the record DOI and display both the version DOI and the concept DOI (all versions).
+- Dataset DOI (version-specific): `https://doi.org/10.5281/zenodo.18770921`
+- Dataset record (all versions / concept DOI): `https://doi.org/10.5281/zenodo.18770920`
 
 ## Code archive DOI
 
-A versioned snapshot of this code is archived via Zenodo GitHub integration.
+A versioned snapshot of this code repository is archived via Zenodo GitHub integration (software record).
 
-- Code DOI (version-specific): `https://doi.org/10.5281/zenodo.YYYYYYYY`  <!-- replace after GitHub release is archived by Zenodo -->
-- Code record (all versions / concept DOI): `https://doi.org/10.5281/zenodo.YYYYYYYY`  <!-- replace if different -->
+- Code DOI (version-specific): `https://doi.org/10.5281/zenodo.18773511`
+- Code record (all versions / concept DOI): `https://doi.org/10.5281/zenodo.18773510`
+
+## GitHub repository
+
+- Repository URL: `https://github.com/armelbatchi/lac-tele-peat-loss-workflow`
 
 ## Suggested citation (code)
 
-Please use the citation in `CITATION.cff` or the Zenodo-generated citation after release.
+Please use the citation in `CITATION.cff` or the Zenodo-generated citation for the software archive DOI above.
 
 ## Reproducibility notes
 

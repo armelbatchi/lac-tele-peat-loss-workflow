@@ -1,0 +1,1601 @@
+---
+title: "WWL"
+author: "Armel Batchi"
+date: "2026-02-20"
+output: html_document
+---
+
+
+```{r}
+# ============================================================
+# RoC – Likouala / Lac Télé (NO API keys) — CORRUPTION-SAFE VERSION
+# Fixes: auto-detect & re-download corrupted Hansen GeoTIFFs
+#
+# Outputs (data_dir):
+#   GeoTIFF:
+#     peat_100m_clip_landscape.tif
+#     lossyear_clip_landscape.tif
+#     treecover2000_clip_landscape.tif (if enabled + succeeds)
+#     loss_on_peat_swamp_2015_2024_clip_landscape.tif
+#   PNG:
+#     peat_100m_clip_landscape.png
+#     lossyear_clip_landscape.png
+#     treecover2000_clip_landscape.png (if enabled + succeeds)
+#     loss_on_peat_swamp_2015_2024.png
+#   CSV:
+#     summary_metrics_corrected.csv
+# ============================================================
+
+# ---- packages ----
+pkgs <- c("sf","terra","dplyr","stringr","units","httr2","jsonlite")
+to_install <- pkgs[!pkgs %in% installed.packages()[,"Package"]]
+if (length(to_install)) install.packages(to_install, repos = "https://cloud.r-project.org")
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+`%||%` <- function(a,b) if(!is.null(a) && length(a) && !all(is.na(a))) a else b
+
+# ---- settings ----
+data_dir <- "roc_lac_tele_data"
+dir.create(data_dir, showWarnings = FALSE, recursive = TRUE)
+
+pp_site_id <- 166739
+buffer_km  <- 50
+
+# Hansen baseline forest threshold (% canopy cover in 2000)
+forest_thresh <- 30
+
+# CongoPeat simplified map class meanings:
+# 1 open water, 2 savanna, 3 other tropical forest (terra firme), 4 peat swamp forest
+peat_class <- 4
+
+# Set FALSE if you want the quickest run (skips huge treecover2000 download)
+download_treecover2000 <- TRUE
+
+# ============================================================
+# Helpers (downloads + validation)
+# ============================================================
+
+# Raise default timeout (big downloads)
+options(timeout = max(3600, getOption("timeout")))
+
+curl_ok <- Sys.which("curl") != ""
+
+curl_download <- function(url, dest, resume = TRUE) {
+  if (!curl_ok) {
+    # fallback
+    utils::download.file(url, destfile = dest, mode = "wb", quiet = TRUE)
+    return(dest)
+  }
+  args <- c(
+    "-L", "--fail",
+    "--retry", "12",
+    "--retry-delay", "5",
+    "--retry-all-errors"
+  )
+  if (resume) args <- c(args, "-C", "-")
+  args <- c(args, "-o", normalizePath(dest, mustWork = FALSE), url)
+  status <- system2("curl", args)
+  if (status != 0) stop("curl download failed: ", url)
+  dest
+}
+
+# HEAD content-length (if provided)
+get_content_length <- function(url) {
+  out <- tryCatch({
+    r <- httr2::request(url) |>
+      httr2::req_method("HEAD") |>
+      httr2::req_timeout(60) |>
+      httr2::req_perform()
+    cl <- httr2::resp_header(r, "content-length")
+    if (is.null(cl) || is.na(cl) || cl == "") NA_real_ else as.numeric(cl)
+  }, error = function(e) NA_real_)
+  out
+}
+
+# Quick integrity test: can terra open the file AND read a small block?
+validate_geotiff <- function(path) {
+  if (!file.exists(path) || file.info(path)$size < 1024) return(FALSE)
+  ok <- tryCatch({
+    r <- terra::rast(path)
+    terra::readStart(r)
+    on.exit(terra::readStop(r), add = TRUE)
+    # read a small window; if the TIFF is truncated/corrupt this often fails fast
+    nr <- min(64, nrow(r)); nc <- min(64, ncol(r))
+    v <- terra::readValues(r, row = 1, nrows = nr, col = 1, ncols = nc)
+    !is.null(v)
+  }, error = function(e) FALSE)
+  isTRUE(ok)
+}
+
+# Download with size-check + corruption-check + forced re-download
+download_geotiff_safe <- function(url, dest, tries = 3) {
+  expected <- get_content_length(url)
+
+  for (i in seq_len(tries)) {
+    message(sprintf("Download attempt %d/%d: %s", i, tries, basename(dest)))
+
+    # resume if file exists; otherwise normal
+    if (!file.exists(dest)) {
+      curl_download(url, dest, resume = FALSE)
+    } else {
+      curl_download(url, dest, resume = TRUE)
+    }
+
+    # size check if we know expected
+    if (!is.na(expected)) {
+      actual <- file.info(dest)$size
+      if (actual != expected) {
+        message(sprintf("Size mismatch (%s): actual %d vs expected %d. Re-downloading fresh...",
+                        basename(dest), actual, expected))
+        unlink(dest)
+        curl_download(url, dest, resume = FALSE)
+      }
+    }
+
+    # corruption check
+    if (validate_geotiff(dest)) return(dest)
+
+    message("GeoTIFF failed validation (likely truncated/corrupt). Deleting and retrying...")
+    unlink(dest)
+    Sys.sleep(2)
+  }
+
+  stop("Failed to download a valid GeoTIFF after ", tries, " tries: ", url)
+}
+
+# ZIP signature check
+is_zip_file <- function(path) {
+  if (!file.exists(path) || file.info(path)$size < 4) return(FALSE)
+  con <- file(path, "rb"); on.exit(close(con), add = TRUE)
+  sig <- readBin(con, what = "raw", n = 2)
+  identical(sig, charToRaw("PK"))
+}
+
+#  public Google Drive download (handles confirm page for large files)
+gdrive_download <- function(file_id, dest, overwrite = FALSE) {
+  if (file.exists(dest) && !overwrite) return(dest)
+  base <- sprintf("https://drive.google.com/uc?export=download&id=%s", file_id)
+
+  r1 <- httr2::request(base) |>
+    httr2::req_options(followlocation = TRUE) |>
+    httr2::req_timeout(180) |>
+    httr2::req_perform()
+
+  ct <- tolower(httr2::resp_header(r1, "content-type") %||% "")
+  body_raw <- httr2::resp_body_raw(r1)
+
+  if (!grepl("text/html", ct)) {
+    writeBin(body_raw, dest)
+    return(dest)
+  }
+
+  html <- rawToChar(body_raw)
+  token <- stringr::str_match(html, "confirm=([0-9A-Za-z_\\-]+)")[,2]
+
+  if (is.na(token) || token == "") {
+    writeBin(body_raw, dest)
+    return(dest)
+  }
+
+  url2 <- paste0(base, "&confirm=", token)
+  r2 <- httr2::request(url2) |>
+    httr2::req_options(followlocation = TRUE) |>
+    httr2::req_timeout(600) |>
+    httr2::req_perform()
+
+  writeBin(httr2::resp_body_raw(r2), dest)
+  dest
+}
+
+utm_epsg_from_lonlat <- function(lon, lat) {
+  zone <- floor((lon + 180) / 6) + 1
+  if (lat >= 0) return(32600 + zone) else return(32700 + zone)
+}
+
+# Sum area (ha) from mask raster
+ha_sum_from_mask <- function(mask_raster) {
+  ha_r <- terra::cellSize(mask_raster, unit = "ha") * (mask_raster * 1)
+  as.numeric(terra::global(ha_r, "sum", na.rm = TRUE)[1,1])
+}
+
+# Save a raster + overlays to PNG
+save_map_png <- function(r, out_png, title, landscape_sf, pa_sf,
+                         width_px = 2400, height_px = 1800, res = 220) {
+  grDevices::png(filename = out_png, width = width_px, height = height_px, res = res)
+  oldpar <- par(no.readonly = TRUE); on.exit(par(oldpar), add = TRUE)
+  par(mar = c(0, 0, 2, 0))
+  plot(r, main = title)
+  plot(sf::st_geometry(landscape_sf), add = TRUE)
+  plot(sf::st_geometry(pa_sf), add = TRUE)
+  grDevices::dev.off()
+}
+
+# Hansen tiles for bbox (10°x10°)
+hansen_tiles_for_bbox <- function(bbox) {
+  xmin <- as.numeric(bbox["xmin"]); xmax <- as.numeric(bbox["xmax"])
+  ymin <- as.numeric(bbox["ymin"]); ymax <- as.numeric(bbox["ymax"])
+  eps <- 1e-9
+
+  lon_start <- floor((xmin + eps) / 10) * 10
+  lon_end   <- floor((xmax - eps) / 10) * 10
+  lon_wests <- seq(lon_start, lon_end, by = 10)
+
+  lat_lower_start <- floor((ymin + eps) / 10) * 10
+  lat_lower_end   <- floor((ymax - eps) / 10) * 10
+  lat_lowers <- seq(lat_lower_start, lat_lower_end, by = 10)
+  lat_uppers <- lat_lowers + 10
+
+  lat_tag <- function(lat_upper) if (lat_upper >= 0) sprintf("%02dN", abs(lat_upper)) else sprintf("%02dS", abs(lat_upper))
+  lon_tag <- function(lon_west)  if (lon_west  >= 0) sprintf("%03dE", abs(lon_west))  else sprintf("%03dW", abs(lon_west))
+
+  tiles <- c()
+  for (lu in lat_uppers) for (lw in lon_wests) tiles <- c(tiles, paste0(lat_tag(lu), "_", lon_tag(lw)))
+  unique(tiles)
+}
+
+mosaic_rasters <- function(r_list) {
+  r_list <- r_list[!vapply(r_list, is.null, logical(1))]
+  if (!length(r_list)) return(NULL)
+  if (length(r_list) == 1) return(r_list[[1]])
+  do.call(terra::mosaic, r_list)
+}
+
+# ============================================================
+# 1) WDPA polygon for Lac Télé / Likouala-aux-herbes (site_id)
+# ============================================================
+wdpa_base <- "https://data-gis.unep-wcmc.org/server/rest/services/ProtectedSites/The_World_Database_of_Protected_Areas/FeatureServer/1/query"
+wdpa_geojson_path <- file.path(data_dir, sprintf("WDPA_site_%s.geojson", pp_site_id))
+
+wdpa_req <- httr2::request(wdpa_base) |>
+  httr2::req_url_query(
+    where = paste0("site_id=", pp_site_id),
+    outFields = "*",
+    returnGeometry = "true",
+    outSR = "4326",
+    f = "geojson"
+  ) |>
+  httr2::req_timeout(180)
+
+resp <- wdpa_req |> httr2::req_perform()
+writeLines(httr2::resp_body_string(resp), wdpa_geojson_path)
+
+pa <- sf::st_read(wdpa_geojson_path, quiet = TRUE) |>
+  sf::st_make_valid() |>
+  sf::st_transform(4326)
+
+if (nrow(pa) == 0) stop("WDPA query returned 0 features. Check site_id or service availability.")
+pa <- pa[!sf::st_is_empty(pa), , drop = FALSE]
+
+sf::write_sf(pa, file.path(data_dir, "lac_tele_wdpa.geojson"), delete_dsn = TRUE)
+
+# ============================================================
+# 2) Landscape buffer (50 km)
+# ============================================================
+ctr <- sf::st_centroid(sf::st_union(pa)) |> sf::st_transform(4326)
+lon <- as.numeric(sf::st_coordinates(ctr)[1,1])
+lat <- as.numeric(sf::st_coordinates(ctr)[1,2])
+utm_epsg <- utm_epsg_from_lonlat(lon, lat)
+
+pa_utm <- sf::st_transform(pa, utm_epsg)
+landscape <- sf::st_buffer(pa_utm, dist = units::set_units(buffer_km, "km")) |>
+  sf::st_transform(4326) |>
+  sf::st_make_valid()
+
+sf::write_sf(landscape, file.path(data_dir, "landscape_buffer.geojson"), delete_dsn = TRUE)
+
+land_v <- terra::vect(landscape)
+pa_v   <- terra::vect(pa)
+
+# ============================================================
+# 3) CongoPeat simplified map (100m) via Google Drive
+# ============================================================
+peat_drive_id <- "1MG6YYZ8ULOXxYRIL-P7LMQIFpk6Kr_mm"
+peat_zip <- file.path(data_dir, "CongoPeat_SimplifiedPeat_100m.zip")
+
+gdrive_download(peat_drive_id, peat_zip)
+if (!is_zip_file(peat_zip)) {
+  message("Peat ZIP looks like HTML confirm page. Retrying overwrite...")
+  gdrive_download(peat_drive_id, peat_zip, overwrite = TRUE)
+}
+if (!is_zip_file(peat_zip)) stop("CongoPeat 100m download is not a ZIP. Download manually from congopeat.net/maps and place it in data_dir.")
+
+peat_dir <- file.path(data_dir, "peat_100m")
+dir.create(peat_dir, showWarnings = FALSE)
+unzip(peat_zip, exdir = peat_dir, overwrite = FALSE)
+
+peat_tifs <- list.files(peat_dir, pattern = "\\.tif$|\\.tiff$", full.names = TRUE, recursive = TRUE)
+if (!length(peat_tifs)) stop("No peat .tif found after unzipping.")
+peat <- terra::rast(peat_tifs[1])
+
+peat_clip <- terra::crop(peat, land_v) |> terra::mask(land_v)
+peat_pa   <- terra::crop(peat, pa_v)   |> terra::mask(pa_v)
+
+peat_tif_out <- file.path(data_dir, "peat_100m_clip_landscape.tif")
+terra::writeRaster(peat_clip, peat_tif_out, overwrite = TRUE)
+
+# ============================================================
+# 4) Hansen GFC 2024 v1.12: lossyear (+ optional treecover2000)
+# ============================================================
+gfc_base <- "https://storage.googleapis.com/earthenginepartners-hansen/GFC-2024-v1.12"
+tiles <- hansen_tiles_for_bbox(sf::st_bbox(landscape))
+message("Hansen tiles needed: ", paste(tiles, collapse = ", "))
+
+download_hansen_band_safe <- function(band, tiles) {
+  rasters <- list()
+  for (t in tiles) {
+    url  <- sprintf("%s/Hansen_GFC-2024-v1.12_%s_%s.tif", gfc_base, band, t)
+    dest <- file.path(data_dir, sprintf("Hansen_%s_%s.tif", band, t))
+    download_geotiff_safe(url, dest, tries = 3)
+    rasters[[t]] <- terra::rast(dest)
+  }
+  rasters
+}
+
+# Always download lossyear (smaller)
+loss_tiles <- download_hansen_band_safe("lossyear", tiles)
+loss_mos   <- mosaic_rasters(loss_tiles)
+if (is.null(loss_mos)) stop("Failed to load Hansen lossyear rasters.")
+
+# treecover2000 is big; make it optional
+tc_mos <- NULL
+if (isTRUE(download_treecover2000)) {
+  tc_tiles <- download_hansen_band_safe("treecover2000", tiles)
+  tc_mos   <- mosaic_rasters(tc_tiles)
+  if (is.null(tc_mos)) {
+    warning("treecover2000 failed; continuing without forest-baseline metrics.")
+    download_treecover2000 <- FALSE
+  }
+}
+
+# Clip Hansen rasters to landscape + PA
+loss_clip <- terra::crop(loss_mos, land_v) |> terra::mask(land_v)
+loss_pa   <- terra::crop(loss_mos, pa_v)   |> terra::mask(pa_v)
+
+loss_tif_out <- file.path(data_dir, "lossyear_clip_landscape.tif")
+terra::writeRaster(loss_clip, loss_tif_out, overwrite = TRUE)
+
+tc_clip <- tc_pa <- NULL
+tc_tif_out <- file.path(data_dir, "treecover2000_clip_landscape.tif")
+if (isTRUE(download_treecover2000) && !is.null(tc_mos)) {
+  # extra safety: validate a small read before cropping/masking
+  if (!validate_geotiff(file.path(data_dir, sprintf("Hansen_treecover2000_%s.tif", tiles[1])))) {
+    warning("treecover2000 GeoTIFF still failing validation; skipping it.")
+    download_treecover2000 <- FALSE
+  } else {
+    tc_clip <- terra::crop(tc_mos, land_v) |> terra::mask(land_v)
+    tc_pa   <- terra::crop(tc_mos, pa_v)   |> terra::mask(pa_v)
+    terra::writeRaster(tc_clip, tc_tif_out, overwrite = TRUE)
+  }
+}
+
+# ============================================================
+# 5) Correct peat definition + overlays
+# ============================================================
+peat_swamp_land <- peat_clip == peat_class
+peat_swamp_pa   <- peat_pa   == peat_class
+
+peat_swamp_land_ha <- ha_sum_from_mask(peat_swamp_land)
+peat_swamp_pa_ha   <- ha_sum_from_mask(peat_swamp_pa)
+
+loss_any_land  <- loss_clip > 0
+loss_2015_land <- loss_clip >= 15
+
+loss_any_pa    <- loss_pa > 0
+loss_2015_pa   <- loss_pa >= 15
+
+# Align peat to loss grid (nearest)
+peat_to_loss_land <- terra::resample(peat_clip, loss_clip, method = "near")
+peat_to_loss_pa   <- terra::resample(peat_pa,   loss_pa,   method = "near")
+
+loss_on_peat_land_all        <- loss_any_land  & (peat_to_loss_land == peat_class)
+loss_on_peat_land_2015_2024  <- loss_2015_land & (peat_to_loss_land == peat_class)
+loss_on_peat_pa_all          <- loss_any_pa    & (peat_to_loss_pa   == peat_class)
+loss_on_peat_pa_2015_2024    <- loss_2015_pa   & (peat_to_loss_pa   == peat_class)
+
+loss_on_peat_land_ha_all       <- ha_sum_from_mask(loss_on_peat_land_all)
+loss_on_peat_land_ha_2015_2024 <- ha_sum_from_mask(loss_on_peat_land_2015_2024)
+loss_on_peat_pa_ha_all         <- ha_sum_from_mask(loss_on_peat_pa_all)
+loss_on_peat_pa_ha_2015_2024   <- ha_sum_from_mask(loss_on_peat_pa_2015_2024)
+
+# Forest-baseline metrics (only if treecover2000 succeeded)
+forest2000_land_ha <- forest2000_pa_ha <- NA_real_
+loss_on_forest_land_ha_all <- loss_on_forest_land_ha_2015 <- NA_real_
+loss_on_forest_pa_ha_all   <- loss_on_forest_pa_ha_2015   <- NA_real_
+
+if (isTRUE(download_treecover2000) && !is.null(tc_clip)) {
+  forest2000_land <- tc_clip >= forest_thresh
+  forest2000_pa   <- tc_pa   >= forest_thresh
+
+  forest2000_land_ha <- ha_sum_from_mask(forest2000_land)
+  forest2000_pa_ha   <- ha_sum_from_mask(forest2000_pa)
+
+  loss_on_forest_land_all  <- loss_any_land  & forest2000_land
+  loss_on_forest_land_2015 <- loss_2015_land & forest2000_land
+  loss_on_forest_pa_all    <- loss_any_pa    & forest2000_pa
+  loss_on_forest_pa_2015   <- loss_2015_pa   & forest2000_pa
+
+  loss_on_forest_land_ha_all  <- ha_sum_from_mask(loss_on_forest_land_all)
+  loss_on_forest_land_ha_2015 <- ha_sum_from_mask(loss_on_forest_land_2015)
+  loss_on_forest_pa_ha_all    <- ha_sum_from_mask(loss_on_forest_pa_all)
+  loss_on_forest_pa_ha_2015   <- ha_sum_from_mask(loss_on_forest_pa_2015)
+}
+
+pct <- function(num, den) if (is.na(den) || den == 0) NA_real_ else 100 * num / den
+
+# Save overlay raster
+loss_on_peat_tif <- file.path(data_dir, "loss_on_peat_swamp_2015_2024_clip_landscape.tif")
+terra::writeRaster(loss_on_peat_land_2015_2024, loss_on_peat_tif, overwrite = TRUE)
+
+# ============================================================
+# 6) Save PNG maps
+# ============================================================
+save_map_png(
+  r = peat_clip,
+  out_png = file.path(data_dir, "peat_100m_clip_landscape.png"),
+  title = "CongoPeat simplified map (100m) — clipped to landscape",
+  landscape_sf = landscape,
+  pa_sf = pa
+)
+
+save_map_png(
+  r = loss_clip,
+  out_png = file.path(data_dir, "lossyear_clip_landscape.png"),
+  title = "Hansen GFC 2024 v1.12 — lossyear — clipped to landscape",
+  landscape_sf = landscape,
+  pa_sf = pa
+)
+
+save_map_png(
+  r = loss_on_peat_land_2015_2024,
+  out_png = file.path(data_dir, "loss_on_peat_swamp_2015_2024.png"),
+  title = "Loss on peat swamp forest (class 4) — 2015–2024",
+  landscape_sf = landscape,
+  pa_sf = pa
+)
+
+if (isTRUE(download_treecover2000) && !is.null(tc_clip)) {
+  save_map_png(
+    r = tc_clip,
+    out_png = file.path(data_dir, "treecover2000_clip_landscape.png"),
+    title = sprintf("Hansen GFC — treecover2000 (%%) — clipped to landscape (>= %d%% = forest)", forest_thresh),
+    landscape_sf = landscape,
+    pa_sf = pa
+  )
+}
+
+# ============================================================
+# 7) Summary CSV (corrected peat + optional forest baseline)
+# ============================================================
+summary <- data.frame(
+  site_id = pp_site_id,
+  buffer_km = buffer_km,
+  hansen_tiles = paste(tiles, collapse = ";"),
+  peat_class_used = peat_class,
+
+  peat_swamp_forest_landscape_ha = peat_swamp_land_ha,
+  peat_swamp_forest_PA_ha        = peat_swamp_pa_ha,
+
+  loss_any_landscape_ha_2001_2024 = ha_sum_from_mask(loss_any_land),
+  loss_2015_2024_landscape_ha     = ha_sum_from_mask(loss_2015_land),
+  loss_any_PA_ha_2001_2024        = ha_sum_from_mask(loss_any_pa),
+  loss_2015_2024_PA_ha            = ha_sum_from_mask(loss_2015_pa),
+
+  loss_on_peat_swamp_landscape_ha_2001_2024 = loss_on_peat_land_ha_all,
+  loss_on_peat_swamp_landscape_ha_2015_2024 = loss_on_peat_land_ha_2015_2024,
+  loss_on_peat_swamp_PA_ha_2001_2024        = loss_on_peat_pa_ha_all,
+  loss_on_peat_swamp_PA_ha_2015_2024        = loss_on_peat_pa_ha_2015_2024,
+
+  pct_peat_swamp_lost_landscape_2001_2024 = pct(loss_on_peat_land_ha_all, peat_swamp_land_ha),
+  pct_peat_swamp_lost_landscape_2015_2024 = pct(loss_on_peat_land_ha_2015_2024, peat_swamp_land_ha),
+  pct_peat_swamp_lost_PA_2001_2024        = pct(loss_on_peat_pa_ha_all, peat_swamp_pa_ha),
+  pct_peat_swamp_lost_PA_2015_2024        = pct(loss_on_peat_pa_ha_2015_2024, peat_swamp_pa_ha),
+
+  forest_thresh_treecover2000_pct = if (isTRUE(download_treecover2000) && !is.null(tc_clip)) forest_thresh else NA_real_,
+  forest2000_landscape_ha = forest2000_land_ha,
+  forest2000_PA_ha        = forest2000_pa_ha,
+  loss_on_forest_landscape_ha_2001_2024 = loss_on_forest_land_ha_all,
+  loss_on_forest_landscape_ha_2015_2024 = loss_on_forest_land_ha_2015,
+  loss_on_forest_PA_ha_2001_2024        = loss_on_forest_pa_ha_all,
+  loss_on_forest_PA_ha_2015_2024        = loss_on_forest_pa_ha_2015,
+  pct_forest_lost_landscape_2001_2024    = pct(loss_on_forest_land_ha_all, forest2000_land_ha),
+  pct_forest_lost_landscape_2015_2024    = pct(loss_on_forest_land_ha_2015, forest2000_land_ha),
+  pct_forest_lost_PA_2001_2024           = pct(loss_on_forest_pa_ha_all, forest2000_pa_ha),
+  pct_forest_lost_PA_2015_2024           = pct(loss_on_forest_pa_ha_2015, forest2000_pa_ha)
+)
+
+print(summary)
+write.csv(summary, file.path(data_dir, "summary_metrics_corrected.csv"), row.names = FALSE)
+
+# ============================================================
+# 8) Final file check
+# ============================================================
+out_files <- c(
+  peat_tif_out,
+  loss_tif_out,
+  loss_on_peat_tif,
+  file.path(data_dir, "peat_100m_clip_landscape.png"),
+  file.path(data_dir, "lossyear_clip_landscape.png"),
+  file.path(data_dir, "loss_on_peat_swamp_2015_2024.png"),
+  file.path(data_dir, "summary_metrics_corrected.csv")
+)
+if (isTRUE(download_treecover2000) && file.exists(tc_tif_out)) {
+  out_files <- c(out_files, tc_tif_out, file.path(data_dir, "treecover2000_clip_landscape.png"))
+}
+
+print(data.frame(file = out_files, exists = file.exists(out_files)))
+message("Done. Outputs saved in: ", normalizePath(data_dir))
+```
+
+
+
+```{r}
+# ============================================================
+# 9) EXTRA OUTPUTS FOR FIGURES SCRIPT (CSV + validation points)
+# Standalone + corrected version
+#
+# WHY THIS EXISTS
+# - Your "figures_extras" script expects 8 CSV/GPKG files in:
+#     roc_lac_tele_data/outputs/
+# - If you restart R, objects like peat_clip/loss_clip no longer exist.
+# - This section reloads rasters/vectors from disk and recreates everything.
+#
+# CREATES (exact filenames expected by your figures code):
+#   sensitivity_forest_threshold_10_30_50.csv
+#   annual_loss_timeseries_2001_2024.csv
+#   annual_loss_timeseries_2001_2024_LONG.csv
+#   qa_raster_summary.csv
+#   peat_class_frequency.csv
+#   lossyear_value_frequency.csv
+#   validation_points_stratified.csv
+#   validation_points_stratified.gpkg
+# ============================================================
+
+# ---- packages (only what this section needs) ----
+pkgs9 <- c("sf", "terra", "dplyr", "tidyr", "readr")
+to_install9 <- pkgs9[!pkgs9 %in% installed.packages()[, "Package"]]
+if (length(to_install9)) install.packages(to_install9, repos = "https://cloud.r-project.org")
+invisible(lapply(pkgs9, library, character.only = TRUE))
+
+# ---- core settings (match your main script) ----
+data_dir <- "roc_lac_tele_data"
+out_dir  <- file.path(data_dir, "outputs")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# These must match your main analysis choices
+forest_thresh <- 30   # baseline treecover2000 threshold used in your main summary
+peat_class    <- 4    # CongoPeat simplified map class for peat swamp forest
+
+# ---- exact filenames expected by your figures script ----
+sens_csv  <- file.path(out_dir, "sensitivity_forest_threshold_10_30_50.csv")
+ann_csv   <- file.path(out_dir, "annual_loss_timeseries_2001_2024.csv")
+annL_csv  <- file.path(out_dir, "annual_loss_timeseries_2001_2024_LONG.csv")
+qa_csv    <- file.path(out_dir, "qa_raster_summary.csv")
+peatF_csv <- file.path(out_dir, "peat_class_frequency.csv")
+lossF_csv <- file.path(out_dir, "lossyear_value_frequency.csv")
+pts_csv   <- file.path(out_dir, "validation_points_stratified.csv")
+pts_gpkg  <- file.path(out_dir, "validation_points_stratified.gpkg")
+
+# ---- input files written by your earlier main script ----
+# (These are the "source" files Section 9 uses to build the CSV/GPKG outputs)
+peat_tif <- file.path(data_dir, "peat_100m_clip_landscape.tif")
+loss_tif <- file.path(data_dir, "lossyear_clip_landscape.tif")
+tc_tif   <- file.path(data_dir, "treecover2000_clip_landscape.tif")  # required here for sensitivity + forest time series
+
+land_path <- file.path(data_dir, "landscape_buffer.geojson")
+pa_path_1 <- file.path(data_dir, "lac_tele_wdpa.geojson")
+pa_path_2 <- file.path(data_dir, "WDPA_site_166739.geojson")
+
+# ---- sanity checks so you know exactly what's missing ----
+required_files <- c(peat_tif, loss_tif, land_path)
+missing_required <- required_files[!file.exists(required_files)]
+if (length(missing_required)) {
+  stop(
+    "Section 9 cannot run because these required files are missing:\n",
+    paste(" -", missing_required, collapse = "\n"),
+    "\nRun your main script first (Sections 1 to 8)."
+  )
+}
+
+if (!file.exists(tc_tif)) {
+  stop(
+    "treecover2000_clip_landscape.tif is missing.\n",
+    "Your figures script expects sensitivity and forest time-series outputs.\n",
+    "Re-run the main script with download_treecover2000 <- TRUE."
+  )
+}
+
+pa_path <- if (file.exists(pa_path_1)) pa_path_1 else if (file.exists(pa_path_2)) pa_path_2 else NA_character_
+if (is.na(pa_path)) {
+  stop("Could not find PA file. Expected one of:\n - ", pa_path_1, "\n - ", pa_path_2)
+}
+
+# ============================================================
+# 9.0 Reload base rasters and vectors from disk (standalone-safe)
+# ============================================================
+
+# Reloading from disk avoids dependence on in-memory objects from prior chunks.
+peat_clip <- terra::rast(peat_tif)
+loss_clip <- terra::rast(loss_tif)
+tc_clip   <- terra::rast(tc_tif)
+
+land_sf <- sf::st_read(land_path, quiet = TRUE) |>
+  sf::st_make_valid() |>
+  sf::st_transform(4326)
+
+pa_sf <- sf::st_read(pa_path, quiet = TRUE) |>
+  sf::st_make_valid() |>
+  sf::st_transform(4326)
+
+land_v <- terra::vect(land_sf)
+pa_v   <- terra::vect(pa_sf)
+
+# Recreate PA-clipped rasters from landscape rasters
+# (This is needed for PA-specific time-series and sensitivity outputs)
+peat_pa <- terra::crop(peat_clip, pa_v) |> terra::mask(pa_v)
+loss_pa <- terra::crop(loss_clip, pa_v) |> terra::mask(pa_v)
+tc_pa   <- terra::crop(tc_clip,   pa_v) |> terra::mask(pa_v)
+
+# Align peat/treecover rasters to lossyear grid (lossyear is our annual time-series base)
+# We do all annual computations on the lossyear grid.
+# NOTE: compareGeom is safest to verify same raster geometry.
+same_geom <- function(a, b) {
+  isTRUE(tryCatch(terra::compareGeom(a, b, stopOnError = FALSE), error = function(e) FALSE))
+}
+
+peat_to_loss_land <- if (!same_geom(peat_clip, loss_clip)) {
+  terra::resample(peat_clip, loss_clip, method = "near")
+} else {
+  peat_clip
+}
+
+peat_to_loss_pa <- terra::crop(peat_to_loss_land, pa_v) |> terra::mask(pa_v)
+
+tc_to_loss_land <- if (!same_geom(tc_clip, loss_clip)) {
+  terra::resample(tc_clip, loss_clip, method = "near")
+} else {
+  tc_clip
+}
+
+tc_to_loss_pa <- terra::crop(tc_to_loss_land, pa_v) |> terra::mask(pa_v)
+
+# Derived logical masks used throughout this section
+# Hansen lossyear coding: 1..24 = 2001..2024 ; 0 = no loss
+loss_any_land   <- loss_clip > 0
+loss_2015_land  <- loss_clip >= 15   # 15..24 = 2015..2024
+
+loss_any_pa     <- loss_pa > 0
+loss_2015_pa    <- loss_pa >= 15
+
+peat_mask_land  <- peat_to_loss_land == peat_class
+peat_mask_pa    <- peat_to_loss_pa   == peat_class
+
+forest_mask_land <- tc_to_loss_land >= forest_thresh
+forest_mask_pa   <- tc_to_loss_pa   >= forest_thresh
+
+loss_on_peat_land_2015_2024 <- loss_2015_land & peat_mask_land
+loss_on_peat_pa_2015_2024   <- loss_2015_pa   & peat_mask_pa
+
+# ============================================================
+# 9.0a Helper functions for this section
+# ============================================================
+
+# Convert a logical mask to a raster that can be sampled:
+# TRUE -> 1, FALSE/NA -> NA (so sampling only returns eligible cells)
+mask_to_sample_raster <- function(x) {
+  terra::ifel(x, 1, NA)
+}
+
+#  area in hectares from a logical mask raster (TRUE = included)
+area_ha_from_logical <- function(mask_r) {
+  ha_r <- terra::cellSize(mask_r, unit = "ha") * (mask_r * 1)
+  as.numeric(terra::global(ha_r, "sum", na.rm = TRUE)[1, 1])
+}
+
+# Clean terra::freq output to exactly value,count
+# terra::freq may return columns like layer,value,count depending on version/options
+clean_freq_df_local <- function(df) {
+  df <- as.data.frame(df)
+  if (ncol(df) < 2) stop("freq table has <2 columns")
+
+  # If first column is "layer", keep value + count
+  if (ncol(df) >= 3 && any(grepl("^layer$", names(df), ignore.case = TRUE))) {
+    df <- df[, 2:3, drop = FALSE]
+  } else {
+    df <- df[, 1:2, drop = FALSE]
+  }
+
+  names(df) <- c("value", "count")
+  df$value <- suppressWarnings(as.integer(df$value))
+  df$count <- suppressWarnings(as.numeric(df$count))
+  df <- df[!is.na(df$value) & !is.na(df$count), , drop = FALSE]
+  df[order(df$value), , drop = FALSE]
+}
+
+# Safe min/max for a raster (used in QA table)
+r_minmax <- function(r) {
+  mn <- tryCatch(as.numeric(terra::global(r, "min", na.rm = TRUE)[1,1]), error = function(e) NA_real_)
+  mx <- tryCatch(as.numeric(terra::global(r, "max", na.rm = TRUE)[1,1]), error = function(e) NA_real_)
+  c(min = mn, max = mx)
+}
+
+# Fraction of raster cells that are NA (simple cell fraction, not area-weighted)
+r_na_fraction <- function(r) {
+  n_all <- terra::ncell(r)
+  n_non_na <- tryCatch(
+    as.numeric(terra::global(!is.na(r), "sum", na.rm = TRUE)[1,1]),
+    error = function(e) NA_real_
+  )
+  if (is.na(n_non_na) || is.na(n_all) || n_all == 0) return(NA_real_)
+  1 - (n_non_na / n_all)
+}
+
+# Annual loss from a Hansen lossyear raster
+# - loss_r: Hansen lossyear raster (0=no loss, 1..24 => 2001..2024)
+# - extra_mask: optional logical/numeric raster defining where to count loss
+#
+# IMPORTANT FIX:
+# We do NOT compare SpatRaster to TRUE (that caused your error).
+# Instead we convert to a logical raster using >0 and !is.na.
+annual_loss_from_lossyear <- function(loss_r, extra_mask = NULL) {
+  stopifnot(inherits(loss_r, "SpatRaster"))
+
+  if (!is.null(extra_mask)) {
+    if (!same_geom(loss_r, extra_mask)) {
+      extra_mask <- terra::resample(extra_mask, loss_r, method = "near")
+    }
+    # Convert any non-zero, non-NA values to TRUE mask on raster grid
+    extra_mask <- (!is.na(extra_mask)) & (extra_mask > 0)
+  }
+
+  area_ha <- terra::cellSize(loss_r, unit = "ha")
+
+  out <- lapply(1:24, function(v) {
+    yr <- 2000 + v
+    ymask <- (loss_r == v)
+    if (!is.null(extra_mask)) ymask <- ymask & extra_mask
+    ha <- as.numeric(terra::global(area_ha * (ymask * 1), "sum", na.rm = TRUE)[1,1])
+    data.frame(year = yr, loss_ha = ha)
+  })
+
+  do.call(rbind, out)
+}
+
+# Simple percent helper
+pct <- function(num, den) if (is.na(den) || den == 0) NA_real_ else 100 * num / den
+
+# Sample random validation points from a logical raster mask
+# Returns a plain data.frame with lon/lat + stratum
+sample_points_from_mask <- function(mask_r, n_target, stratum_label, seed = 1) {
+  set.seed(seed)
+
+  samp_r <- mask_to_sample_raster(mask_r)
+
+  cells <- terra::spatSample(
+    samp_r,
+    size = n_target,
+    method = "random",
+    cells = TRUE,
+    values = FALSE,
+    xy = FALSE,
+    na.rm = TRUE,
+    replace = FALSE,
+    warn = FALSE
+  )
+
+  cells <- as.vector(cells)
+  cells <- cells[!is.na(cells)]
+
+  if (length(cells) == 0) {
+    warning("No available cells for stratum: ", stratum_label)
+    return(data.frame(
+      point_id = character(0),
+      stratum  = character(0),
+      cell     = integer(0),
+      lon      = numeric(0),
+      lat      = numeric(0),
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  xy <- terra::xyFromCell(samp_r, cells)
+
+  out <- data.frame(
+    point_id = sprintf("%s_%03d", stratum_label, seq_along(cells)),
+    stratum  = stratum_label,
+    cell     = as.integer(cells),
+    lon      = as.numeric(xy[,1]),
+    lat      = as.numeric(xy[,2]),
+    stringsAsFactors = FALSE
+  )
+
+  out
+}
+
+# ============================================================
+# 9.1 Frequency tables for peat and lossyear (for S4 and S5)
+# ============================================================
+
+peat_freq <- clean_freq_df_local(terra::freq(peat_clip))
+loss_freq <- clean_freq_df_local(terra::freq(loss_clip))
+
+# Optional labels (handy for inspection; figures script can ignore them)
+peat_freq <- peat_freq |>
+  dplyr::mutate(
+    class_label = dplyr::case_when(
+      value == 1L ~ "Open water",
+      value == 2L ~ "Savanna",
+      value == 3L ~ "Other tropical forest (terra firme)",
+      value == 4L ~ "Peat swamp forest",
+      TRUE ~ paste("Class", value)
+    )
+  )
+
+loss_freq <- loss_freq |>
+  dplyr::mutate(
+    label = dplyr::case_when(
+      value == 0L ~ "No loss",
+      value >= 1L & value <= 24L ~ as.character(2000L + value),
+      TRUE ~ paste("Value", value)
+    )
+  )
+
+readr::write_csv(peat_freq, peatF_csv)
+readr::write_csv(loss_freq, lossF_csv)
+
+# ============================================================
+# 9.2 QA raster summary CSV (for S3)
+# ============================================================
+
+qa_tbl <- dplyr::bind_rows(
+  {
+    mm <- r_minmax(peat_clip)
+    data.frame(
+      layer = "peat_100m_clip_landscape",
+      ncell = terra::ncell(peat_clip),
+      na_fraction = r_na_fraction(peat_clip),
+      min = mm["min"],
+      max = mm["max"]
+    )
+  },
+  {
+    mm <- r_minmax(loss_clip)
+    data.frame(
+      layer = "lossyear_clip_landscape",
+      ncell = terra::ncell(loss_clip),
+      na_fraction = r_na_fraction(loss_clip),
+      min = mm["min"],
+      max = mm["max"]
+    )
+  },
+  {
+    mm <- r_minmax(tc_clip)
+    data.frame(
+      layer = "treecover2000_clip_landscape",
+      ncell = terra::ncell(tc_clip),
+      na_fraction = r_na_fraction(tc_clip),
+      min = mm["min"],
+      max = mm["max"]
+    )
+  },
+  {
+    mm <- r_minmax(loss_on_peat_land_2015_2024)
+    data.frame(
+      layer = "loss_on_peat_swamp_2015_2024_clip_landscape",
+      ncell = terra::ncell(loss_on_peat_land_2015_2024),
+      na_fraction = r_na_fraction(loss_on_peat_land_2015_2024),
+      min = mm["min"],
+      max = mm["max"]
+    )
+  }
+)
+
+readr::write_csv(qa_tbl, qa_csv)
+
+# ============================================================
+# 9.3 Sensitivity CSV for thresholds 10, 30, 50 (for S1)
+# ============================================================
+
+thresholds <- c(10, 30, 50)
+
+sens_tbl <- lapply(thresholds, function(thr) {
+  forest_land_thr <- tc_to_loss_land >= thr
+  forest_pa_thr   <- tc_to_loss_pa   >= thr
+
+  forest2000_landscape_ha <- area_ha_from_logical(forest_land_thr)
+  forest2000_PA_ha        <- area_ha_from_logical(forest_pa_thr)
+
+  loss_on_forest_land_all  <- loss_any_land  & forest_land_thr
+  loss_on_forest_pa_all    <- loss_any_pa    & forest_pa_thr
+  loss_on_forest_land_2015 <- loss_2015_land & forest_land_thr
+  loss_on_forest_pa_2015   <- loss_2015_pa   & forest_pa_thr
+
+  loss_on_forest_landscape_ha_2001_2024 <- area_ha_from_logical(loss_on_forest_land_all)
+  loss_on_forest_PA_ha_2001_2024        <- area_ha_from_logical(loss_on_forest_pa_all)
+  loss_on_forest_landscape_ha_2015_2024 <- area_ha_from_logical(loss_on_forest_land_2015)
+  loss_on_forest_PA_ha_2015_2024        <- area_ha_from_logical(loss_on_forest_pa_2015)
+
+  data.frame(
+    threshold_pct = thr,
+
+    forest2000_landscape_ha = forest2000_landscape_ha,
+    forest2000_PA_ha        = forest2000_PA_ha,
+
+    loss_on_forest_landscape_ha_2001_2024 = loss_on_forest_landscape_ha_2001_2024,
+    loss_on_forest_PA_ha_2001_2024        = loss_on_forest_PA_ha_2001_2024,
+
+    loss_on_forest_landscape_ha_2015_2024 = loss_on_forest_landscape_ha_2015_2024,
+    loss_on_forest_PA_ha_2015_2024        = loss_on_forest_PA_ha_2015_2024,
+
+    pct_forest_lost_landscape_2001_2024 = pct(loss_on_forest_landscape_ha_2001_2024, forest2000_landscape_ha),
+    pct_forest_lost_PA_2001_2024        = pct(loss_on_forest_PA_ha_2001_2024,        forest2000_PA_ha),
+
+    pct_forest_lost_landscape_2015_2024 = pct(loss_on_forest_landscape_ha_2015_2024, forest2000_landscape_ha),
+    pct_forest_lost_PA_2015_2024        = pct(loss_on_forest_PA_ha_2015_2024,        forest2000_PA_ha)
+  )
+}) |>
+  dplyr::bind_rows()
+
+readr::write_csv(sens_tbl, sens_csv)
+
+# ============================================================
+# 9.4 Annual loss time-series CSVs (wide + long) for 2001–2024 (for S2)
+# ============================================================
+
+# Peat-based annual loss
+ann_peat_land <- annual_loss_from_lossyear(loss_clip, peat_mask_land) |>
+  dplyr::rename(loss_on_peat_landscape_ha = loss_ha)
+
+ann_peat_pa <- annual_loss_from_lossyear(loss_pa, peat_mask_pa) |>
+  dplyr::rename(loss_on_peat_PA_ha = loss_ha)
+
+# Forest-based annual loss (using baseline threshold forest_thresh, default 30)
+ann_forest_land <- annual_loss_from_lossyear(loss_clip, forest_mask_land) |>
+  dplyr::rename(loss_on_forest_landscape_ha = loss_ha)
+
+ann_forest_pa <- annual_loss_from_lossyear(loss_pa, forest_mask_pa) |>
+  dplyr::rename(loss_on_forest_PA_ha = loss_ha)
+
+# Wide table expected by your figures script fallback
+ann_wide <- ann_peat_land |>
+  dplyr::left_join(ann_peat_pa,    by = "year") |>
+  dplyr::left_join(ann_forest_land, by = "year") |>
+  dplyr::left_join(ann_forest_pa,   by = "year") |>
+  dplyr::arrange(year)
+
+# Long table (explicit metric column) expected by your figures script if present
+ann_long <- ann_wide |>
+  tidyr::pivot_longer(
+    cols = -year,
+    names_to = "metric",
+    values_to = "loss_ha"
+  ) |>
+  dplyr::arrange(metric, year)
+
+readr::write_csv(ann_wide, ann_csv)
+readr::write_csv(ann_long, annL_csv)
+
+# ============================================================
+# 9.5 Validation points (CSV + GPKG) for S6
+# ============================================================
+# We create 3 strata on the lossyear grid:
+#   A = loss on peat (2015–2024)
+#   B = peat, no recent loss (2015–2024)
+#   C = non-peat background (within valid land raster area)
+#
+# Your figures script later recodes labels using "^A_", "^B_", "^C_".
+
+# Strata masks (all on lossyear grid)
+stratum_A <- loss_on_peat_land_2015_2024
+stratum_B <- peat_mask_land & (!loss_2015_land)
+stratum_C <- (!peat_mask_land) & (!is.na(loss_clip))   # background on valid raster cells
+
+# Optional: keep only cells inside the landscape raster footprint that also have peat data coverage
+# (helps avoid weird edge cases if grids differ in NA pattern)
+valid_footprint <- (!is.na(loss_clip)) & (!is.na(peat_to_loss_land)) & (!is.na(tc_to_loss_land))
+stratum_A <- stratum_A & valid_footprint
+stratum_B <- stratum_B & valid_footprint
+stratum_C <- stratum_C & valid_footprint
+
+# Choose target sample sizes per stratum (edit if you want)
+n_A <- 60
+n_B <- 60
+n_C <- 60
+
+pts_A <- sample_points_from_mask(stratum_A, n_A, "A_loss_on_peat_2015_2024", seed = 1001)
+pts_B <- sample_points_from_mask(stratum_B, n_B, "B_peat_no_recent_loss",   seed = 1002)
+pts_C <- sample_points_from_mask(stratum_C, n_C, "C_non_peat_background",   seed = 1003)
+
+pts_df <- dplyr::bind_rows(pts_A, pts_B, pts_C) |>
+  dplyr::mutate(
+    source = "Section9_stratified_random",
+    crs_epsg = 4326
+  )
+
+if (nrow(pts_df) == 0) {
+  stop("No validation points were generated. Check raster masks and coverage.")
+}
+
+# Save CSV (your figures script can read this directly if GPKG fails)
+readr::write_csv(pts_df, pts_csv)
+
+# Save GPKG with layer name EXACTLY as expected by your figures script
+# It tries: st_read(pts_gpkg, layer = "validation_points", ...)
+pts_sf <- sf::st_as_sf(pts_df, coords = c("lon", "lat"), crs = 4326)
+
+if (file.exists(pts_gpkg)) unlink(pts_gpkg)
+sf::st_write(pts_sf, pts_gpkg, layer = "validation_points", quiet = TRUE)
+
+# ============================================================
+# 9.6 Final checks + helpful console messages
+# ============================================================
+
+out_files_9 <- c(
+  sens_csv, ann_csv, annL_csv, qa_csv, peatF_csv, lossF_csv, pts_csv, pts_gpkg
+)
+
+print(data.frame(
+  file = basename(out_files_9),
+  exists = file.exists(out_files_9),
+  bytes = ifelse(file.exists(out_files_9), file.info(out_files_9)$size, NA)
+), row.names = FALSE)
+
+cat("\n--- Validation point counts by stratum ---\n")
+print(pts_df |>
+  dplyr::count(stratum, name = "n") |>
+  dplyr::arrange(stratum))
+
+message("DONE. Section 9 outputs written to: ", normalizePath(out_dir))
+message("Files created:")
+message(" - sensitivity_forest_threshold_10_30_50.csv")
+message(" - annual_loss_timeseries_2001_2024.csv")
+message(" - annual_loss_timeseries_2001_2024_LONG.csv")
+message(" - qa_raster_summary.csv")
+message(" - peat_class_frequency.csv")
+message(" - lossyear_value_frequency.csv")
+message(" - validation_points_stratified.csv")
+message(" - validation_points_stratified.gpkg")
+```
+
+
+
+
+
+```{r}
+# ============================================================
+# Creates: PNG (high-res) + PDF (vector) in:
+# ============================================================
+
+# ---- packages ----
+pkgs <- c(
+  "ggplot2","patchwork","scales","readr","dplyr","tidyr",
+  "sf","terra","forcats"
+)
+to_install <- pkgs[!pkgs %in% installed.packages()[,"Package"]]
+if(length(to_install)) install.packages(to_install, repos="https://cloud.r-project.org")
+invisible(lapply(pkgs, library, character.only=TRUE))
+
+# Optional: north arrow / scale bar (nice but not required)
+if(!("ggspatial" %in% installed.packages()[,"Package"])) {
+  try(install.packages("ggspatial", repos="https://cloud.r-project.org"), silent=TRUE)
+}
+has_ggspatial <- "ggspatial" %in% installed.packages()[,"Package"]
+if(has_ggspatial) library(ggspatial)
+
+# ---- settings ----
+data_dir <- "roc_lac_tele_data"
+out_dir  <- file.path(data_dir, "outputs")
+fig_dir  <- file.path(out_dir, "figures_extras")
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Inputs for optional recomputation (if CSV frequency tables are wrong)
+loss_path <- file.path(data_dir, "lossyear_clip_landscape.tif")
+peat_path <- file.path(data_dir, "peat_100m_clip_landscape.tif")
+
+# Vectors for validation points map
+land_path <- file.path(data_dir, "landscape_buffer.geojson")
+pa_path_1 <- file.path(data_dir, "lac_tele_wdpa.geojson")
+pa_path_2 <- file.path(data_dir, "WDPA_site_166739.geojson")
+
+# CSV outputs from Section 9 (generated by first chunk)
+sens_csv  <- file.path(out_dir, "sensitivity_forest_threshold_10_30_50.csv")
+ann_csv   <- file.path(out_dir, "annual_loss_timeseries_2001_2024.csv")
+annL_csv  <- file.path(out_dir, "annual_loss_timeseries_2001_2024_LONG.csv")
+qa_csv    <- file.path(out_dir, "qa_raster_summary.csv")
+peatF_csv <- file.path(out_dir, "peat_class_frequency.csv")
+lossF_csv <- file.path(out_dir, "lossyear_value_frequency.csv")
+pts_csv   <- file.path(out_dir, "validation_points_stratified.csv")
+pts_gpkg  <- file.path(out_dir, "validation_points_stratified.gpkg")
+
+# ---- style ----
+theme_sd <- function() {
+  theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face="bold", size=16),
+      plot.subtitle = element_text(size=12, color="grey30"),
+      axis.title = element_text(face="bold"),
+      panel.grid.minor = element_blank(),
+      legend.position = "bottom",
+      legend.title = element_text(face="bold"),
+      strip.text = element_text(face="bold")
+    )
+}
+
+# Okabe-Ito (colorblind-friendly)
+pal_okabe <- c("#0072B2","#D55E00","#009E73","#CC79A7","#F0E442","#56B4E9","#000000")
+
+# ---- save helper (PNG + PDF) ----
+pdf_device <- if (capabilities("cairo")) cairo_pdf else pdf
+save_plot <- function(p, stem, w=10, h=6, dpi=320) {
+  ggsave(file.path(fig_dir, paste0(stem, ".png")), p, width=w, height=h, dpi=dpi, bg="white")
+  ggsave(file.path(fig_dir, paste0(stem, ".pdf")), p, width=w, height=h, device=pdf_device)
+}
+
+# ============================================================
+# Helpers for frequency handling across terra versions
+# ============================================================
+
+# Sample raster values 
+sample_raster_values <- function(r, n = 1e6, max_tries = 3) {
+  for(i in seq_len(max_tries)) {
+    cells <- terra::spatSample(
+      r, size = n, method = "random",
+      cells = TRUE, values = FALSE, xy = FALSE,
+      na.rm = TRUE, warn = FALSE
+    )
+    cells <- as.vector(cells)
+    if(length(cells) == 0) next
+
+    v <- r[cells]
+    if(is.data.frame(v)) v <- v[[1]]
+    if(is.matrix(v))    v <- v[,1]
+    v <- as.vector(v)
+    v <- v[!is.na(v)]
+    if(length(v) > 0) return(v)
+  }
+  numeric(0)
+}
+
+# Clean any freq table to exactly (value,count)
+clean_freq_df <- function(df) {
+  df <- as.data.frame(df)
+  if(ncol(df) < 2) stop("freq table has <2 columns.")
+
+  if(ncol(df) >= 3 && any(grepl("^layer$", names(df), ignore.case=TRUE))) {
+    df <- df[, 2:3, drop=FALSE]
+  } else {
+    df <- df[, 1:2, drop=FALSE]
+  }
+
+  names(df) <- c("value","count")
+  df$value <- suppressWarnings(as.integer(df$value))
+  df$count <- suppressWarnings(as.numeric(df$count))
+  df <- df[!is.na(df$value) & !is.na(df$count), ]
+  df[order(df$value), , drop = FALSE]
+}
+
+# Friendly checker for required files
+need_file <- function(path, label = basename(path)) {
+  if (!file.exists(path)) {
+    stop(
+      "Missing required file: ", label, "\n",
+      "Expected at: ", normalizePath(path, winslash = "/", mustWork = FALSE), "\n",
+      "Run the FIRST chunk (with the new Section 9) before this figures chunk."
+    )
+  }
+}
+
+# ============================================================
+# 1) Sensitivity figure (thresholds 10/30/50)
+# ============================================================
+need_file(sens_csv)
+sens <- readr::read_csv(sens_csv, show_col_types = FALSE)
+
+sens_area <- sens |>
+  select(threshold_pct, forest2000_landscape_ha, forest2000_PA_ha) |>
+  pivot_longer(-threshold_pct, names_to="where", values_to="ha") |>
+  mutate(where = recode(where,
+                        "forest2000_landscape_ha"="Landscape",
+                        "forest2000_PA_ha"="Protected area"))
+
+sens_pct_1524 <- sens |>
+  select(threshold_pct, pct_forest_lost_landscape_2015_2024, pct_forest_lost_PA_2015_2024) |>
+  pivot_longer(-threshold_pct, names_to="where", values_to="pct") |>
+  mutate(where = recode(where,
+                        "pct_forest_lost_landscape_2015_2024"="Landscape",
+                        "pct_forest_lost_PA_2015_2024"="Protected area"))
+
+p_sens_A <- ggplot(sens_area, aes(threshold_pct, ha, color=where)) +
+  geom_line(linewidth=1.2) +
+  geom_point(size=3) +
+  scale_x_continuous(breaks=sort(unique(sens$threshold_pct))) +
+  scale_y_continuous(labels=scales::comma) +
+  scale_color_manual(values=pal_okabe[1:2]) +
+  labs(
+    title="Sensitivity to forest definition (treecover2000 threshold)",
+    subtitle="Baseline forest extent across canopy thresholds (10%, 30%, 50%)",
+    x="Treecover2000 threshold (%)",
+    y="Baseline forest area (ha)",
+    color=NULL
+  ) + theme_sd()
+
+p_sens_B <- ggplot(sens_pct_1524, aes(threshold_pct, pct, color=where)) +
+  geom_line(linewidth=1.2) +
+  geom_point(size=3) +
+  scale_x_continuous(breaks=sort(unique(sens$threshold_pct))) +
+  scale_y_continuous(labels=function(x) paste0(round(x,2), "%")) +
+  scale_color_manual(values=pal_okabe[1:2]) +
+  labs(
+    title="Sensitivity of recent forest loss fraction",
+    subtitle="Percent forest lost during 2015 to 2024 under each threshold",
+    x="Treecover2000 threshold (%)",
+    y="Forest loss fraction (2015 to 2024)",
+    color=NULL
+  ) + theme_sd()
+
+p_sens <- p_sens_A / p_sens_B + patchwork::plot_layout(guides="collect")
+save_plot(p_sens, "S1_sensitivity_thresholds", w=11, h=9)
+
+# ============================================================
+# 2) Annual loss time series (2001 to 2024)
+# ============================================================
+need_file(ann_csv)
+ann <- readr::read_csv(ann_csv, show_col_types = FALSE)
+
+ann_long <- if(file.exists(annL_csv)) {
+  readr::read_csv(annL_csv, show_col_types = FALSE) |>
+    rename(loss_ha = dplyr::any_of(c("loss_ha","value")))
+} else {
+  ann |>
+    pivot_longer(-year, names_to="metric", values_to="loss_ha")
+}
+
+ann_long <- ann_long |>
+  mutate(
+    domain = case_when(
+      grepl("forest", metric) ~ "Loss on baseline forest (treecover2000 >= 30%)",
+      grepl("peat",   metric) ~ "Loss on peat swamp forest (CongoPeat class 4)",
+      TRUE ~ "Other"
+    ),
+    geography = case_when(
+      grepl("landscape", metric) ~ "Landscape",
+      grepl("_PA_",      metric) ~ "Protected area",
+      TRUE ~ "Other"
+    )
+  )
+
+p_ts <- ggplot(ann_long, aes(year, loss_ha, color=geography)) +
+  geom_line(linewidth=1.05) +
+  geom_point(size=1.8) +
+  facet_wrap(~domain, scales="free_y", ncol=1) +
+  geom_vline(xintercept=2015, linetype="dashed", linewidth=0.8, color="grey40") +
+  scale_x_continuous(breaks=seq(min(ann_long$year, na.rm=TRUE), max(ann_long$year, na.rm=TRUE), by=3)) +
+  scale_y_continuous(labels=scales::comma) +
+  scale_color_manual(values=pal_okabe[1:2]) +
+  labs(
+    title="Annual loss time series (2001 to 2024)",
+    subtitle="Annual loss (ha) within buffered landscape and protected area (dashed line marks 2015)",
+    x="Year",
+    y="Annual loss (ha)",
+    color=NULL
+  ) + theme_sd()
+
+save_plot(p_ts, "S2_annual_loss_timeseries", w=12, h=8)
+
+# ============================================================
+# 3) QA summary (NA% + min to max range)
+# ============================================================
+need_file(qa_csv)
+qa <- readr::read_csv(qa_csv, show_col_types = FALSE) |>
+  mutate(
+    layer = factor(layer, levels = rev(unique(layer))),
+    na_pct = 100 * na_fraction
+  )
+
+p_qa_A <- ggplot(qa, aes(na_pct, layer)) +
+  geom_col(fill="grey75", color="grey20") +
+  geom_text(aes(label=sprintf("%.2f%%", na_pct)), hjust=-0.05, size=4) +
+  scale_x_continuous(limits=c(0, max(qa$na_pct, na.rm=TRUE)*1.18)) +
+  labs(
+    title="QA missing data fraction by layer",
+    subtitle="NA values can include masked out cells outside polygons within the raster bounding box",
+    x="NA (%)",
+    y=NULL
+  ) + theme_sd() +
+  theme(legend.position="none")
+
+p_qa_B <- ggplot(qa, aes(y=layer)) +
+  geom_segment(aes(x=min, xend=max, yend=layer), linewidth=3, color=pal_okabe[1]) +
+  geom_point(aes(x=min), size=3, color="black") +
+  geom_point(aes(x=max), size=3, color="black") +
+  labs(
+    title="QA value range min to max",
+    subtitle="Fast check for unexpected encoding or processing issues",
+    x="Value",
+    y=NULL
+  ) + theme_sd()
+
+p_qa <- p_qa_A | p_qa_B
+save_plot(p_qa, "S3_QA_summary", w=14, h=7)
+
+# ============================================================
+# 4) Peat class frequency (use CSV if good, otherwise recompute)
+# ============================================================
+recompute_peat_freq <- function() {
+  need_file(peat_path)
+  r <- terra::rast(peat_path)
+  v <- sample_raster_values(r, n=1e6)
+  if(length(v) == 0) stop("Could not sample peat values (all NA?)")
+  v <- as.integer(v)
+  tab <- as.data.frame(table(v), stringsAsFactors=FALSE)
+  names(tab) <- c("value","count")
+  tab$value <- as.integer(tab$value)
+  tab$count <- as.numeric(tab$count)
+  tab[order(tab$value), ]
+}
+
+peatF <- if(file.exists(peatF_csv)) {
+  tryCatch(readr::read_csv(peatF_csv, show_col_types = FALSE), error=function(e) data.frame())
+} else data.frame()
+
+peatF_ok <- nrow(peatF) >= 1 && all(c("value","count") %in% tolower(names(peatF)))
+if(!peatF_ok) {
+  peatF <- recompute_peat_freq()
+  readr::write_csv(peatF, peatF_csv)
+} else {
+  peatF <- clean_freq_df(peatF)
+}
+
+peat_labels <- c(
+  "1"="Open water",
+  "2"="Savanna",
+  "3"="Other tropical forest (terra firme)",
+  "4"="Peat swamp forest"
+)
+
+peatF2 <- peatF |>
+  mutate(
+    value_chr = as.character(value),
+    class = recode(value_chr, !!!peat_labels, .default = paste("Class", value_chr)),
+    pct = 100 * count / sum(count)
+  ) |>
+  arrange(value)
+
+p_peat <- ggplot(peatF2, aes(x=fct_inorder(class), y=pct, fill=fct_inorder(class))) +
+  geom_col(color="grey20", width=0.82) +
+  geom_text(aes(label=sprintf("%.1f%%", pct)), vjust=-0.4, size=4) +
+  scale_fill_manual(values=pal_okabe[seq_len(min(length(pal_okabe), nrow(peatF2)))]) +
+  labs(
+    title="CongoPeat class composition (clipped raster)",
+    subtitle="Percent of non NA cells by class",
+    x=NULL,
+    y="Percent of cells",
+    fill=NULL
+  ) + theme_sd() +
+  theme(axis.text.x = element_text(angle=15, hjust=1))
+
+save_plot(p_peat, "S4_peat_class_frequency", w=12, h=7)
+
+# ============================================================
+# 5) Lossyear frequency (fixed: define lossF2 first)
+# ============================================================
+recompute_loss_freq <- function() {
+  need_file(loss_path)
+  r <- terra::rast(loss_path)
+  f <- terra::freq(r)
+  clean_freq_df(f)
+}
+
+lossF <- if(file.exists(lossF_csv)) {
+  tryCatch(readr::read_csv(lossF_csv, show_col_types = FALSE), error=function(e) data.frame())
+} else data.frame()
+
+lossF_ok <- nrow(lossF) >= 1 && all(c("value","count") %in% tolower(names(lossF)))
+if(!lossF_ok) {
+  lossF2 <- recompute_loss_freq()
+  readr::write_csv(lossF2, lossF_csv)
+} else {
+  lossF2 <- clean_freq_df(lossF)
+}
+
+# Add year labels
+lossF2 <- lossF2 |>
+  mutate(
+    label = dplyr::case_when(
+      value == 0L ~ "No loss",
+      value >= 1L & value <= 24L ~ as.character(2000L + value),
+      TRUE ~ paste0("Value ", value)
+    )
+  )
+
+loss_summary <- lossF2 |>
+  dplyr::mutate(group = ifelse(value == 0L, "No loss (value = 0)", "Any loss (values 1 to 24)")) |>
+  dplyr::group_by(group) |>
+  dplyr::summarise(count = sum(count), .groups = "drop") |>
+  dplyr::mutate(
+    pct = 100 * count / sum(count),
+    group = factor(group, levels = c("No loss (value = 0)", "Any loss (values 1 to 24)")),
+    label_txt = paste0(scales::comma(count), " (", sprintf("%.1f", pct), "%)")
+  )
+
+loss_years_only <- lossF2 |>
+  dplyr::filter(value > 0, value <= 24) |>
+  dplyr::arrange(value) |>
+  dplyr::mutate(
+    year = 2000L + value,
+    pct_among_loss = 100 * count / sum(count)
+  )
+
+p_loss_A <- ggplot(loss_summary, aes(x = 1, y = pct, fill = group)) +
+  geom_col(width = 0.6, color = "grey20") +
+  geom_text(
+    aes(label = label_txt),
+    position = position_stack(vjust = 0.5),
+    size = 4,
+    color = "black"
+  ) +
+  coord_flip() +
+  scale_y_continuous(labels = function(x) paste0(x, "%"), expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_manual(values = c("No loss (value = 0)" = "grey50", "Any loss (values 1 to 24)" = pal_okabe[2])) +
+  labs(
+    title = "Hansen GFC lossyear distribution (clipped raster)",
+    subtitle = "Panel A no loss vs any loss cells",
+    x = NULL,
+    y = "Percent of cells",
+    fill = NULL
+  ) +
+  theme_sd() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+p_loss_B <- ggplot(loss_years_only, aes(x = factor(year), y = pct_among_loss)) +
+  geom_col(fill = pal_okabe[2], color = "grey25", width = 0.86) +
+  geom_text(
+    data = loss_years_only |>
+      dplyr::filter(count == max(count)),
+    aes(label = paste0("n=", scales::comma(count))),
+    vjust = -0.4,
+    size = 3.8
+  ) +
+  scale_y_continuous(labels = function(x) paste0(sprintf("%.1f", x), "%"),
+                     expand = expansion(mult = c(0, 0.06))) +
+  labs(
+    subtitle = "Panel B annual loss years among loss cells only (1 to 24 equals 2001 to 2024)",
+    x = "Loss year",
+    y = "Percent of loss cells"
+  ) +
+  theme_sd() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+p_lossfreq <- p_loss_A / p_loss_B + patchwork::plot_layout(heights = c(0.9, 1.4))
+save_plot(p_lossfreq, "S5_lossyear_frequency", w = 14, h = 9)
+
+# ============================================================
+# 6) Validation points map (strata overview)
+# ============================================================
+need_file(land_path)
+pa_path <- if (file.exists(pa_path_1)) pa_path_1 else if (file.exists(pa_path_2)) pa_path_2 else NA_character_
+if (is.na(pa_path)) stop("No PA GeoJSON found. Expected one of: ", pa_path_1, " or ", pa_path_2)
+
+land_sf <- sf::st_read(land_path, quiet = TRUE) |>
+  sf::st_make_valid() |>
+  sf::st_transform(4326)
+
+pa_sf <- sf::st_read(pa_path, quiet = TRUE) |>
+  sf::st_make_valid() |>
+  sf::st_transform(4326)
+
+pts <- NULL
+if (file.exists(pts_gpkg)) {
+  pts <- tryCatch(
+    sf::st_read(pts_gpkg, layer = "validation_points", quiet = TRUE),
+    error = function(e) NULL
+  )
+}
+if (is.null(pts) && file.exists(pts_csv)) {
+  pts_df <- readr::read_csv(pts_csv, show_col_types = FALSE)
+  pts <- sf::st_as_sf(pts_df, coords = c("lon", "lat"), crs = 4326)
+}
+if (is.null(pts)) stop("No validation points file found. Run first chunk Section 9.")
+
+# Recode strata to clean labels
+pts <- pts |>
+  dplyr::mutate(
+    stratum = dplyr::case_when(
+      grepl("^A_", stratum) ~ "A: loss on peat (2015 to 2024)",
+      grepl("^B_", stratum) ~ "B: peat no recent loss",
+      grepl("^C_", stratum) ~ "C: non peat background",
+      TRUE ~ as.character(stratum)
+    )
+  )
+
+stratum_order <- c(
+  "A: loss on peat (2015 to 2024)",
+  "B: peat no recent loss",
+  "C: non peat background"
+)
+
+count_tab <- pts |>
+  sf::st_drop_geometry() |>
+  dplyr::count(stratum, name = "n") |>
+  dplyr::mutate(
+    stratum = factor(stratum, levels = c(stratum_order, setdiff(unique(stratum), stratum_order)))
+  ) |>
+  dplyr::arrange(stratum) |>
+  dplyr::mutate(
+    stratum = as.character(stratum),
+    stratum_lab = paste0(stratum, " (n=", n, ")")
+  )
+
+pts <- pts |>
+  dplyr::left_join(count_tab[, c("stratum", "stratum_lab")], by = "stratum") |>
+  dplyr::mutate(
+    stratum_lab = factor(stratum_lab, levels = count_tab$stratum_lab)
+  )
+
+base_col_map <- c(
+  "A: loss on peat (2015 to 2024)" = pal_okabe[1],
+  "B: peat no recent loss"         = pal_okabe[2],
+  "C: non peat background"         = pal_okabe[3]
+)
+
+legend_col_map <- setNames(
+  base_col_map[count_tab$stratum],
+  count_tab$stratum_lab
+)
+
+p_pts <- ggplot() +
+  geom_sf(data = land_sf, fill = "grey97", color = "grey35", linewidth = 0.5) +
+  geom_sf(data = pa_sf, fill = NA, color = "black", linewidth = 0.9) +
+  geom_sf(data = pts, aes(color = stratum_lab), size = 1.6, alpha = 0.92) +
+  scale_color_manual(values = legend_col_map, drop = FALSE) +
+  labs(
+    title = "Stratified validation points",
+    subtitle = "Points sampled across strata for reproducible manual interpretation",
+    color = NULL
+  ) +
+  theme_sd() +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 1)))
+
+if (has_ggspatial) {
+  na_style <- tryCatch(
+    ggspatial::north_arrow_fancy_orienteering(text_size = 8),
+    error = function(e) ggspatial::north_arrow_fancy_orienteering()
+  )
+
+  p_pts <- p_pts +
+    ggspatial::annotation_scale(
+      location = "bl",
+      width_hint = 0.25,
+      text_cex = 0.8
+    ) +
+    ggspatial::annotation_north_arrow(
+      location = "br",
+      which_north = "true",
+      style = na_style
+    )
+}
+
+save_plot(p_pts, "S6_validation_points_map", w = 11, h = 8)
+
+# ============================================================
+# Final message
+# ============================================================
+message("DONE. Figures saved in: ", normalizePath(fig_dir))
+print(data.frame(
+  figure = c("S1","S2","S3","S4","S5","S6"),
+  png = file.exists(file.path(fig_dir, c(
+    "S1_sensitivity_thresholds.png",
+    "S2_annual_loss_timeseries.png",
+    "S3_QA_summary.png",
+    "S4_peat_class_frequency.png",
+    "S5_lossyear_frequency.png",
+    "S6_validation_points_map.png"
+  )))
+))
+```
+
+

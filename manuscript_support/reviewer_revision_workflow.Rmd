@@ -1,0 +1,52 @@
+---
+title: "Lac Télé peat swamp forest loss screening: reviewer revision workflow"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+```
+
+# Purpose
+
+This R Markdown file documents the reviewer-revision workflow. The recommended executable workflow is the split script workflow in `00_run_all.R` and the `R/` folder.
+
+# Run complete workflow
+
+```{r run-workflow, eval=FALSE}
+source("../00_run_all.R")
+```
+
+# Manual validation
+
+The workflow creates:
+
+```text
+outputs/reviewer_revision/validation_points_stratified_labeling_template.csv
+```
+
+After visual interpretation in Google Earth, Sentinel-2, Planet/NICFI, or another independent reference source, fill `reference_class_binary` with either:
+
+```text
+reference_loss_on_peat
+reference_not_loss_on_peat
+```
+
+Save as:
+
+```text
+outputs/reviewer_revision/validation_points_stratified_labelled.csv
+```
+
+Then rerun:
+
+```r
+source("00_run_all.R")
+```
+
+# Outputs generated
+
+The workflow writes expanded validation samples, accuracy metrics, area-adjusted estimates, annual loss tables, forest-threshold sensitivity analyses, resampling sensitivity, QA metadata, FAIR documentation, and checksums.

@@ -1,23 +1,77 @@
-# Reproduce the workflow outputs
+# Reproduction instructions
 
-This document provides minimal instructions to run `WWL_V6.Rmd` and reproduce the analysis outputs described in the associated Data Descriptor.
-
-## Prerequisites
-
-- R (recommended: R >= 4.3)
-- RStudio (optional but convenient)
-- Internet access to install missing R packages
-- The dataset archive `outputs_all.zip` (see dataset DOI in `README.md`)
-
-## Setup
-
-1. Create a working directory and place `WWL_V6.Rmd` in it.
-2. Download and extract `outputs_all.zip` into the same working directory.
-3. Preserve the original file names and folder structure from the archive.
-
-## Run the workflow
-
-Open `WWL_V6.Rmd` in RStudio and knit the document, or run from R:
+## 1. Install R packages
 
 ```r
-rmarkdown::render("WWL_V6.Rmd")
+install.packages("terra", repos = "https://cloud.r-project.org")
+```
+
+## 2. Prepare the data directory
+
+Create one folder containing the input rasters:
+
+```text
+roc_lac_tele_data/
+├── peat_100m_clip_landscape.tif
+├── lossyear_clip_landscape.tif
+├── treecover2000_clip_landscape.tif
+└── loss_on_peat_swamp_2015_2024_clip_landscape.tif
+```
+
+The fourth raster can be recreated by the workflow if it is missing.
+
+## 3. Run all scripts
+
+From the repository root:
+
+```r
+Sys.setenv(LAC_TELE_DATA_DIR = "/path/to/roc_lac_tele_data")
+source("00_run_all.R")
+```
+
+## 4. Manual validation
+
+Open:
+
+```text
+outputs/reviewer_revision/validation_points_stratified_labeling_template.csv
+```
+
+Complete the column `reference_class_binary` using only:
+
+```text
+reference_loss_on_peat
+reference_not_loss_on_peat
+```
+
+Use the following interpretation sources where available:
+
+```text
+Google Earth web imagery
+Sentinel-2
+Planet/NICFI
+very high-resolution imagery
+field verification
+```
+
+Save as:
+
+```text
+outputs/reviewer_revision/validation_points_stratified_labelled.csv
+```
+
+Rerun:
+
+```r
+source("00_run_all.R")
+```
+
+## 5. Rebuild Zenodo dataset archive
+
+The final script creates:
+
+```text
+outputs_all.zip
+```
+
+Upload this ZIP to the Zenodo dataset record, not to GitHub.
